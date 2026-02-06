@@ -1,325 +1,791 @@
-# -*- coding: utf-8 -*-
-"""Summary
 """
-# @Author: gviejo
-# @Date:   2022-01-02 23:33:42
-# @Last Modified by:   gviejo
-# @Last Modified time: 2022-12-06 21:30:23
+Functions to compute n-dimensional tuning curves.
+"""
 
+import inspect
 import warnings
+from collections.abc import Iterable
+from functools import wraps
 
 import numpy as np
 import pandas as pd
-from scipy.linalg import hankel
+import xarray as xr
 
 from .. import core as nap
 
 
-def compute_discrete_tuning_curves(group, dict_ep):
+def compute_tuning_curves(
+    data,
+    features,
+    bins=10,
+    range=None,
+    epochs=None,
+    fs=None,
+    feature_names=None,
+    return_pandas=False,
+    return_counts=False,
+):
     """
-        Compute discrete tuning curves of a TsGroup using a dictionnary of epochs.
-    The function returns a pandas DataFrame with each row being a key of the dictionnary of epochs
-    and each column being a neurons.
-
-       This function can typically being used for a set of stimulus being presented for multiple epochs.
-    An example of the dictionnary is :
-
-        >>> dict_ep =  {
-                "stim0": nap.IntervalSet(start=0, end=1),
-                "stim1":nap.IntervalSet(start=2, end=3)
-            }
-    In this case, the function will return a pandas DataFrame :
-
-        >>> tc
-                   neuron0    neuron1    neuron2
-        stim0        0 Hz       1 Hz       2 Hz
-        stim1        3 Hz       4 Hz       5 Hz
-
+    Computes n-dimensional tuning curves relative to n features.
 
     Parameters
     ----------
-    group : nap.TsGroup
-        The group of Ts/Tsd for which the tuning curves will be computed
-    dict_ep : dict
-        Dictionary of IntervalSets
+    data : TsGroup, TsdFrame, Ts, Tsd
+        The data for which the tuning curves will be computed. This usually corresponds to the activity of the
+        neurons, either as spike times (TsGroup or Ts) or continuous values (TsdFrame or Tsd).
+    features : Tsd, TsdFrame
+        The features (i.e. one column per feature). This usually corresponds to behavioral variables such as
+        position, head direction, speed, etc.
+    bins : sequence or int
+        The bin specification:
+
+        * A sequence of arrays describing the monotonically increasing bin
+          edges along each dimension.
+        * The number of bins for each dimension (nx, ny, ... =bins)
+        * The number of bins for all dimensions (nx=ny=...=bins).
+    range : sequence, optional
+        A sequence of entries per feature, each an optional (lower, upper) tuple giving
+        the outer bin edges to be used if the edges are not given explicitly in
+        `bins`.
+        An entry of None in the sequence results in the minimum and maximum
+        values being used for the corresponding dimension.
+        The default, None, is equivalent to passing a tuple of D None values.
+    epochs : IntervalSet, optional
+        The epochs on which tuning curves are computed.
+        If None, the epochs are the time support of the features.
+    fs : float, optional
+        The exact sampling frequency of the features used to normalise the tuning curves.
+        Unit should match that of the features. If not passed, it is estimated.
+    feature_names : list, optional
+        A list of feature names. If not passed, the column names in `features` are used.
+    return_pandas : bool, optional
+        If True, the function returns a pandas.DataFrame instead of an xarray.DataArray.
+        Note that this will not work if the features are not 1D and that occupancy and bin edges
+        will not be stored as attributes.
+    return_counts : bool, optional
+        If True, does not divide the spike counts by occupancy, but returns the counts directly.
+        The occupancy is stored in the xarray attributes, so the division can be performed after any
+        particular processing steps.
+        If the input is a TsdFrame, this does not do anything.
 
     Returns
     -------
-    pandas.DataFrame
-        Table of firing rate for each neuron and each IntervalSet
+    xarray.DataArray
+        A tensor containing the tuning curves with labeled bin centres.
+        The bin edges and occupancy are stored as attributes.
 
-    Raises
-    ------
-    RuntimeError
-        If group is not a TsGroup object.
+    Examples
+    --------
+    In the simplest case, we can pass a group of spikes per neuron and a single feature:
+
+        >>> import pynapple as nap
+        >>> import numpy as np; np.random.seed(42)
+        >>> group = nap.TsGroup({
+        ...     1: nap.Ts(np.arange(0, 100, 0.1)),
+        ...     2: nap.Ts(np.arange(0, 100, 0.2))
+        ... })
+        >>> feature = nap.Tsd(d=np.arange(0, 100, 0.1) % 1, t=np.arange(0, 100, 0.1))
+        >>> tcs = nap.compute_tuning_curves(group, feature, bins=10)
+        >>> tcs
+        <xarray.DataArray (unit: 2, 0: 10)> Size: 160B
+        array([[10., 10., 10., 10., 10., 10., 10., 10., 10., 10.],
+               [10.,  0., 10.,  0., 10.,  0., 10.,  0., 10.,  0.]])
+        Coordinates:
+          * unit     (unit) int64 16B 1 2
+          * 0        (0) float64 80B 0.045 0.135 0.225 0.315 ... 0.585 0.675 0.765 0.855
+        Attributes:
+            occupancy:  [100. 100. 100. 100. 100. 100. 100. 100. 100. 100.]
+            bin_edges:  [array([0.  , 0.09, 0.18, 0.27, 0.36, 0.45, 0.54, 0.63, 0.72,...
+            fs:         10.0
+            rates:      [10.01001001  5.00500501]
+
+    The function can also take multiple features, in which case it computes n-dimensional tuning curves.
+    We can specify the number of bins for each feature:
+
+        >>> features = nap.TsdFrame(
+        ...     d=np.stack(
+        ...         [
+        ...             np.arange(0, 100, 0.1) % 1,
+        ...             np.arange(0, 100, 0.1) % 2
+        ...         ],
+        ...         axis=1
+        ...     ),
+        ...     t=np.arange(0, 100, 0.1)
+        ... )
+        >>> tcs = nap.compute_tuning_curves(group, features, bins=[5, 3])
+        >>> tcs
+        <xarray.DataArray (unit: 2, 0: 5, 1: 3)> Size: 240B
+        array([[[10., 10., nan],
+                [10., 10., 10.],
+                [10., nan, 10.],
+                [10., 10., 10.],
+                [nan, 10., 10.]],
+        ...
+               [[ 5.,  5., nan],
+                [ 5., 10.,  0.],
+                [ 5., nan,  5.],
+                [10.,  0.,  5.],
+                [nan,  5.,  5.]]])
+        Coordinates:
+          * unit     (unit) int64 16B 1 2
+          * 0        (0) float64 40B 0.09 0.27 0.45 0.63 0.81
+          * 1        (1) float64 24B 0.3167 0.95 1.583
+        Attributes:
+            occupancy:  [[100. 100.  nan]\\n [100.  50.  50.]\\n [100.  nan 100.]\\n [ 5...
+            bin_edges:  [array([0.  , 0.18, 0.36, 0.54, 0.72, 0.9 ]), array([0.      ...
+            fs:         10.0
+            rates:      [10.01001001  5.00500501]
+
+    Or even specify the bin edges directly:
+
+        >>> tcs = nap.compute_tuning_curves(
+        ...     group,
+        ...     features,
+        ...     bins=[np.linspace(0, 1, 5), np.linspace(0, 2, 3)]
+        ... )
+        >>> tcs
+        <xarray.DataArray (unit: 2, 0: 4, 1: 2)> Size: 128B
+        array([[[10.        , 10.        ],
+                [10.        , 10.        ],
+                [10.        , 10.        ],
+                [10.        , 10.        ]],
+        ...
+               [[ 6.66666667,  6.66666667],
+                [ 5.        ,  5.        ],
+                [ 3.33333333,  3.33333333],
+                [ 5.        ,  5.        ]]])
+        Coordinates:
+          * unit     (unit) int64 16B 1 2
+          * 0        (0) float64 32B 0.125 0.375 0.625 0.875
+          * 1        (1) float64 16B 0.5 1.5
+        Attributes:
+            occupancy:  [[150. 150.]\\n [100. 100.]\\n [150. 150.]\\n [100. 100.]]
+            bin_edges:  [array([0.  , 0.25, 0.5 , 0.75, 1.  ]), array([0., 1., 2.])]
+            fs:         10.0
+            rates:      [10.01001001  5.00500501]
+
+    In all of these cases, it is also possible to pass continuous values instead of spikes (e.g. calcium imaging data), in that case the mean response is computed:
+
+        >>> frame = nap.TsdFrame(d=np.random.rand(2000, 3), t=np.arange(0, 100, 0.05))
+        >>> tcs = nap.compute_tuning_curves(frame, feature, bins=10)
+        >>> tcs
+        <xarray.DataArray (unit: 3, 0: 10)> Size: 240B
+        array([[0.49147343, 0.50190395, 0.50971339, 0.50128013, 0.54332711,
+                0.49712328, 0.49594611, 0.5110517 , 0.52247351, 0.52057658],
+               [0.51132036, 0.46410557, 0.47732505, 0.49830908, 0.53523019,
+                0.53099429, 0.48668499, 0.44198555, 0.49222208, 0.47453398],
+               [0.46591801, 0.50662914, 0.46875882, 0.48734997, 0.51836574,
+                0.50722266, 0.48943577, 0.49730095, 0.47944075, 0.48623693]])
+        Coordinates:
+          * unit     (unit) int64 24B 0 1 2
+          * 0        (0) float64 80B 0.045 0.135 0.225 0.315 ... 0.585 0.675 0.765 0.855
+        Attributes:
+            occupancy:  [100. 100. 100. 100. 100. 100. 100. 100. 100. 100.]
+            bin_edges:  [array([0.  , 0.09, 0.18, 0.27, 0.36, 0.45, 0.54, 0.63, 0.72,...
     """
-    if not isinstance(group, nap.TsGroup):
-        raise RuntimeError("Unknown format for group")
 
-    idx = np.sort(list(dict_ep.keys()))
+    # check data
+    if not isinstance(data, (nap.TsdFrame, nap.TsGroup, nap.Ts, nap.Tsd)):
+        raise TypeError("data should be a TsdFrame, TsGroup, Ts, or Tsd.")
 
-    tuning_curves = pd.DataFrame(index=idx, columns=list(group.keys()), data=0)
+    # check features
+    if not isinstance(features, (nap.TsdFrame, nap.Tsd)):
+        raise TypeError("features should be a Tsd or TsdFrame.")
 
-    for k in dict_ep.keys():
-        if not isinstance(dict_ep[k], nap.IntervalSet):
-            raise RuntimeError("Key {} in dict_ep is not an IntervalSet".format(k))
-
-        for n in group.keys():
-            tuning_curves.loc[k, n] = float(len(group[n].restrict(dict_ep[k])))
-
-        tuning_curves.loc[k] = tuning_curves.loc[k] / dict_ep[k].tot_length("s")
-
-    return tuning_curves
-
-
-def compute_1d_tuning_curves(group, feature, nb_bins, ep=None, minmax=None):
-    """
-    Computes 1-dimensional tuning curves relative to a 1d feature.
-
-    Parameters
-    ----------
-    group : TsGroup
-        The group of Ts/Tsd for which the tuning curves will be computed
-    feature : Tsd
-        The 1-dimensional target feature (e.g. head-direction)
-    nb_bins : int
-        Number of bins in the tuning curve
-    ep : IntervalSet, optional
-        The epoch on which tuning curves are computed.
-        If None, the epoch is the time support of the feature.
-    minmax : tuple or list, optional
-        The min and max boundaries of the tuning curves.
-        If None, the boundaries are inferred from the target feature
-
-    Returns
-    -------
-    pandas.DataFrame
-        DataFrame to hold the tuning curves
-
-    Raises
-    ------
-    RuntimeError
-        If group is not a TsGroup object.
-
-    """
-    if not isinstance(group, nap.TsGroup):
-        raise RuntimeError("Unknown format for group")
-
-    if minmax is None:
-        bins = np.linspace(np.min(feature), np.max(feature), nb_bins + 1)
-    else:
-        bins = np.linspace(minmax[0], minmax[1], nb_bins + 1)
-    idx = bins[0:-1] + np.diff(bins) / 2
-
-    tuning_curves = pd.DataFrame(index=idx, columns=list(group.keys()))
-
-    if isinstance(ep, nap.IntervalSet):
-        group_value = group.value_from(feature, ep)
-        occupancy, _ = np.histogram(feature.restrict(ep).values, bins)
-    else:
-        group_value = group.value_from(feature)
-        occupancy, _ = np.histogram(feature.values, bins)
-
-    for k in group_value:
-        count, _ = np.histogram(group_value[k].values, bins)
-        count = count / occupancy
-        count[np.isnan(count)] = 0.0
-        tuning_curves[k] = count
-        tuning_curves[k] = count * feature.rate
-
-    return tuning_curves
-
-
-def compute_2d_tuning_curves(group, feature, nb_bins, ep=None, minmax=None):
-    """
-    Computes 2-dimensional tuning curves relative to a 2d feature
-
-    Parameters
-    ----------
-    group : TsGroup
-        The group of Ts/Tsd for which the tuning curves will be computed
-    feature : TsdFrame
-        The 2d feature (i.e. 2 columns features).
-    nb_bins : int
-        Number of bins in the tuning curves
-    ep : IntervalSet, optional
-        The epoch on which tuning curves are computed.
-        If None, the epoch is the time support of the feature.
-    minmax : tuple or list, optional
-        The min and max boundaries of the tuning curves given as:
-        (minx, maxx, miny, maxy)
-        If None, the boundaries are inferred from the target variable
-
-    Returns
-    -------
-    tuple
-        A tuple containing: \n
-        tc (dict): Dictionnary of the tuning curves with dimensions (nb_bins, nb_bins).\n
-        xy (list): List of bins center in the two dimensions
-
-    Raises
-    ------
-    RuntimeError
-        If group is not a TsGroup object or if feature is not 2 columns only.
-
-    """
-    if feature.shape[1] != 2:
-        raise RuntimeError("feature should have 2 columns only.")
-
-    if type(group) is not nap.TsGroup:
-        raise RuntimeError("Unknown format for group")
-
-    if isinstance(ep, nap.IntervalSet):
-        feature = feature.restrict(ep)
-    else:
-        ep = feature.time_support
-
-    cols = list(feature.columns)
-    groups_value = {}
-    binsxy = {}
-
-    for i, c in enumerate(cols):
-        groups_value[c] = group.value_from(feature[c], ep)
-        if minmax is None:
-            bins = np.linspace(np.min(feature[c]), np.max(feature[c]), nb_bins + 1)
-        else:
-            bins = np.linspace(minmax[i + i % 2], minmax[i + 1 + i % 2], nb_bins + 1)
-        binsxy[c] = bins
-
-    occupancy, _, _ = np.histogram2d(
-        feature[cols[0]].values,
-        feature[cols[1]].values,
-        [binsxy[cols[0]], binsxy[cols[1]]],
-    )
-
-    tc = {}
-    for n in group.keys():
-        count, _, _ = np.histogram2d(
-            groups_value[cols[0]][n].values,
-            groups_value[cols[1]][n].values,
-            [binsxy[cols[0]], binsxy[cols[1]]],
+    # check feature names
+    if feature_names is None:
+        feature_names = (
+            features.columns if isinstance(features, nap.TsdFrame) else ["0"]
         )
-        count = count / occupancy
-        # count[np.isnan(count)] = 0.0
-        tc[n] = count * feature.rate
+    else:
+        if (
+            not hasattr(feature_names, "__len__")
+            or isinstance(feature_names, str)
+            or not all(isinstance(n, str) for n in feature_names)
+        ):
+            raise TypeError("feature_names should be a list of strings.")
+        if len(feature_names) != (
+            1 if isinstance(features, nap.Tsd) else features.shape[-1]
+        ):
+            raise ValueError("feature_names should match the number of features.")
 
-    xy = [binsxy[c][0:-1] + np.diff(binsxy[c]) / 2 for c in binsxy.keys()]
+    # check epochs
+    if epochs is None:
+        epochs = features.time_support
+    elif isinstance(epochs, nap.IntervalSet):
+        features = features.restrict(epochs)
+    else:
+        raise TypeError("epochs should be an IntervalSet.")
+    data = data.restrict(epochs)
 
-    return tc, xy
+    # check fs
+    if fs is None:
+        fs = 1 / np.mean(features.time_diff(epochs=epochs).values)
+    if not isinstance(fs, (int, float)):
+        raise TypeError("fs should be a number (int or float)")
+
+    # check range
+    if range is not None and isinstance(range, tuple):
+        if features.ndim == 1 or features.shape[1] == 1:
+            range = [range]
+        else:
+            raise ValueError(
+                "range should be a sequence of tuples, one for each feature."
+            )
+
+    # check return_pandas
+    if (
+        return_pandas != 1
+        and return_pandas != 0
+        and not isinstance(return_pandas, bool)
+    ):
+        raise TypeError("return_pandas should be a boolean.")
+
+    # check return_counts
+    if (
+        return_counts != 1
+        and return_counts != 0
+        and not isinstance(return_counts, bool)
+    ):
+        raise TypeError("return_counts should be a boolean.")
+
+    # occupancy
+    occupancy, bin_edges = np.histogramdd(features, bins=bins, range=range)
+
+    # tuning curves
+    keys = (
+        data.keys()
+        if isinstance(data, nap.TsGroup)
+        else data.columns if isinstance(data, nap.TsdFrame) else [0]
+    )
+    tcs = np.zeros([len(keys), *occupancy.shape])
+    if isinstance(data, (nap.TsGroup, nap.Ts)):
+        # SPIKES
+        if isinstance(data, nap.Ts):
+            data = nap.TsGroup({0: data})
+        for i, n in enumerate(keys):
+            tcs[i] = np.histogramdd(
+                data[n].value_from(features),
+                bins=bin_edges,
+            )[0]
+        occupancy[occupancy == 0.0] = np.nan
+        if not return_counts:
+            tcs = (tcs / occupancy) * fs
+    else:
+        # RATES
+        values = data.value_from(features)
+        if isinstance(data, nap.Tsd):
+            data = np.expand_dims(data.values, -1)
+        counts = np.histogramdd(values, bins=bin_edges)[0]
+        counts[counts == 0] = np.nan
+        for i, n in enumerate(keys):
+            tcs[i] = np.histogramdd(
+                values,
+                weights=data[:, i],
+                bins=bin_edges,
+            )[0]
+        tcs /= counts
+        tcs[np.isnan(tcs)] = 0.0
+        tcs[:, occupancy == 0.0] = np.nan
+
+    attrs = {"occupancy": occupancy, "bin_edges": bin_edges, "fs": fs}
+    if isinstance(data, nap.TsGroup):
+        attrs["rates"] = data.rates
+    tcs = xr.DataArray(
+        tcs,
+        coords={
+            "unit": keys,
+            **{
+                str(feature_name): e[:-1] + np.diff(e) / 2
+                for feature_name, e in zip(feature_names, bin_edges)
+            },
+        },
+        attrs=attrs,
+    )
+    if return_pandas:
+        return tcs.to_pandas().T
+    else:
+        return tcs
 
 
-def compute_1d_mutual_info(tc, feature, ep=None, minmax=None, bitssec=False):
+def compute_response_per_epoch(data, epochs_dict, return_pandas=False):
     """
-    Mutual information as defined in
-
-    Skaggs, W. E., McNaughton, B. L., & Gothard, K. M. (1993).
-    An information-theoretic approach to deciphering the hippocampal code.
-    In Advances in neural information processing systems (pp. 1030-1037).
+    Compute mean response per epoch, given a dictionary of epochs.
 
     Parameters
     ----------
-    tc : pandas.DataFrame or numpy.ndarray
-        Tuning curves in columns
-    feature : Tsd
-        The feature that was used to compute the tuning curves
-    ep : IntervalSet, optional
-        The epoch over which the tuning curves were computed
-        If None, the epoch is the time support of the feature.
-    minmax : tuple or list, optional
-        The min and max boundaries of the tuning curves.
-        If None, the boundaries are inferred from the target feature
-    bitssec : bool, optional
-        By default, the function return bits per spikes.
-        Set to true for bits per seconds
+    data : TsGroup, TsdFrame, Ts, Tsd
+        The data for which the tuning curves will be computed.
+    epochs_dict : dict
+        Dictionary of IntervalSets.
+    return_pandas : bool, optional
+        If True, the function returns a pandas.DataFrame instead of an xarray.DataArray.
+
+    Returns
+    -------
+    xarray.DataArray
+        A tensor containing the tuning curves with labeled epochs.
+
+    Examples
+    --------
+    This function is typically used for a set of discrete stimuli being presented for multiple epochs.
+    The stimulus epochs can overlap, though note that epochs within an IntervalSet can not overlap.
+
+        >>> import pynapple as nap
+        >>> import numpy as np; np.random.seed(42)
+        >>> epochs_dict =  {
+        ...     "stim0": nap.IntervalSet(start=0, end=30),
+        ...     "stim1":nap.IntervalSet(start=60, end=90)
+        ... }
+        >>> group = nap.TsGroup({
+        ...     1: nap.Ts(np.arange(0, 100, 0.1)),
+        ...     2: nap.Ts(np.arange(0, 100, 0.2))
+        ... })
+        >>> tcs = nap.compute_response_per_epoch(group, epochs_dict)
+        >>> tcs
+        <xarray.DataArray (unit: 2, epochs: 2)> Size: 32B
+        array([[10.03333333, 10.03333333],
+               [ 5.03333333,  5.03333333]])
+        Coordinates:
+          * unit     (unit) int64 16B 1 2
+          * epochs   (epochs) <U5 40B 'stim0' 'stim1'
+
+    You can also pass a TsdFrame (e.g. calcium imaging data), in that case the response is computed:
+
+        >>> frame = nap.TsdFrame(d=np.random.rand(2000, 3), t=np.arange(0, 100, 0.05))
+        >>> tcs = nap.compute_response_per_epoch(frame, epochs_dict)
+        >>> tcs
+        <xarray.DataArray (unit: 3, epochs: 2)> Size: 48B
+        array([[0.50946668, 0.50897635],
+               [0.48343249, 0.48191892],
+               [0.50063158, 0.48748094]])
+        Coordinates:
+          * unit     (unit) int64 24B 0 1 2
+          * epochs   (epochs) <U5 40B 'stim0' 'stim1'
+    """
+    # check data
+    if not isinstance(data, (nap.TsdFrame, nap.TsGroup, nap.Ts, nap.Tsd)):
+        raise TypeError("data should be a TsdFrame, TsGroup, Ts, or Tsd.")
+
+    # check epochs_dict
+    if (
+        not isinstance(epochs_dict, dict)
+        or len(epochs_dict) == 0
+        or not all(isinstance(epoch, nap.IntervalSet) for epoch in epochs_dict.values())
+    ):
+        raise TypeError("epochs_dict should be a dictionary of IntervalSets.")
+
+    # check return_pandas
+    if (
+        return_pandas != 1
+        and return_pandas != 0
+        and not isinstance(return_pandas, bool)
+    ):
+        raise TypeError("return_pandas should be a boolean.")
+
+    # tuning curves
+    keys = (
+        data.keys()
+        if isinstance(data, nap.TsGroup)
+        else data.columns if isinstance(data, nap.TsdFrame) else [0]
+    )
+    if isinstance(data, (nap.TsGroup, nap.Ts)):
+        # SPIKES
+        if isinstance(data, nap.Ts):
+            data = nap.TsGroup({0: data}, time_support=data.time_support)
+        tcs = np.stack(
+            [
+                data.restrict(epoch).count().values.sum(axis=0) / epoch.tot_length("s")
+                for epoch in epochs_dict.values()
+            ],
+            axis=1,
+        )
+    else:
+        # RATES
+        if isinstance(data, nap.Tsd):
+            data = nap.TsdFrame(
+                d=np.expand_dims(data.values, -1),
+                t=data.times(),
+                time_support=data.time_support,
+            )
+        tcs = np.stack(
+            [
+                data.restrict(epoch).values.mean(axis=0)
+                for epoch in epochs_dict.values()
+            ],
+            axis=1,
+        )
+
+    tcs = xr.DataArray(
+        tcs,
+        coords={"unit": keys, "epochs": list(epochs_dict.keys())},
+    )
+    if return_pandas:
+        return tcs.to_pandas().T
+    else:
+        return tcs
+
+
+def compute_mutual_information(tuning_curves, rates=None):
+    """
+    Computes mutual information from n-dimensional tuning curves.
+
+    This function implements Skaggs et al.'s [1] metric to quantify
+    the information content of a neuron's firing with respect to a variable
+    (e.g., position), based on its tuning curve.
+
+    The mutual information in bits per second is given by:
+
+    .. math::
+
+        I_\\text{bits/s} = \\sum_x P(x) \\lambda(x) \\log_2 \\left( \\frac{\\lambda(x)}{\\bar{\\lambda}} \\right)
+
+    where:
+
+    - :math:`P(x)` is the probability of being in bin :math:`x` (occupancy),
+    - :math:`\\lambda(x)` is the firing rate of the neuron in bin :math:`x`,
+    - :math:`\\bar{\\lambda}` is the overall mean firing rate.
+
+    The information per spike is computed by dividing the result by the mean firing rate:
+
+    .. math::
+
+        I_\\text{bits/spike} = \\frac{I}{\\bar{\\lambda}}
+
+    References
+    ----------
+    .. [1] Skaggs, W. E., McNaughton, B. L., & Gothard, K. M. (1993).
+           An information-theoretic approach to deciphering the hippocampal code.
+           In Advances in neural information processing systems (pp. 1030-1037).
+
+    Parameters
+    ----------
+    tuning_curves : xarray.DataArray
+        Tuning curves as computed by :func:`~pynapple.process.tuning_curves.compute_tuning_curves`.
+    rates : list or numpy.ndarray, optional
+        Mean firing rates of the units. By default :func:`~pynapple.process.tuning_curves.compute_tuning_curves` saves
+        the mean firing rates over the epochs of the tuning curves in the tuning curve objects.
+        This argument can be used to pass your own.
 
     Returns
     -------
     pandas.DataFrame
-        Spatial Information (default is bits/spikes)
+        A table containing the spatial information per unit, in both bits/sec and bits/spike.
+
+    Examples
+    --------
+    We can compute the mutual information between a variable and a set of neurons' firing from the tuning curves:
+
+        >>> import pynapple as nap
+        >>> import numpy as np; np.random.seed(42)
+        >>> epoch = nap.IntervalSet([0, 100])
+        >>> t = np.arange(0, 100, 0.01)
+        >>> feature = nap.Tsd(t=t, d=np.clip(t*0.01 + np.random.normal(0, 0.02, len(t)), 0, 1), time_support=epoch)
+        >>> group = nap.TsGroup({
+        ...     1: nap.Ts(t[(feature.values >= 0.2) & (feature.values < 0.3)]),
+        ...     2: nap.Ts(t[(feature.values >= 0.7) & (feature.values < 0.8)])
+        ... }, time_support=epoch)
+        >>> tcs = nap.compute_tuning_curves(group, feature, bins=10)
+        >>> tcs
+        <xarray.DataArray (unit: 2, 0: 10)> Size: 160B
+        array([[  0.,   0., 100.,   0.,   0.,   0.,   0.,   0.,   0.,   0.],
+               [  0.,   0.,   0.,   0.,   0.,   0.,   0., 100.,   0.,   0.]])
+        Coordinates:
+          * unit     (unit) int64 16B 1 2
+          * 0        (0) float64 80B 0.05 0.15 0.25 0.35 0.45 0.55 0.65 0.75 0.85 0.95
+        Attributes:
+            occupancy:  [ 985. 1009. 1014.  996.  993. 1008.  991. 1008.  999.  997.]
+            bin_edges:  [array([0. , 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1. ])]
+            fs:         100.0
+            rates:      [10.14 10.08]
+        >>> MI = nap.compute_mutual_information(tcs)
+        >>> MI
+            bits/sec  bits/spike
+        1  33.480966    3.301870
+        2  33.369159    3.310432
     """
-    if isinstance(tc, pd.DataFrame):
-        columns = tc.columns.values
-        fx = np.atleast_2d(tc.values)
-    elif isinstance(tc, np.ndarray):
-        fx = np.atleast_2d(tc)
-        columns = np.arange(tc.shape[1])
+    if not isinstance(tuning_curves, xr.DataArray):
+        raise TypeError(
+            "tuning_curves should be an xr.DataArray as computed by compute_tuning_curves."
+        )
 
-    nb_bins = tc.shape[0] + 1
-    if minmax is None:
-        bins = np.linspace(np.min(feature), np.max(feature), nb_bins)
-    else:
-        bins = np.linspace(minmax[0], minmax[1], nb_bins)
+    if rates is not None:
+        if not isinstance(rates, (list, np.ndarray)):
+            raise TypeError("rates should be a list or array.")
+        if tuning_curves.shape[0] != len(rates):
+            raise ValueError(
+                "dimension of rates should match that of the tuning curves."
+            )
 
-    if isinstance(ep, nap.IntervalSet):
-        occupancy, _ = np.histogram(feature.restrict(ep).values, bins)
-    else:
-        occupancy, _ = np.histogram(feature.values, bins)
-    occupancy = occupancy / occupancy.sum()
-    occupancy = occupancy[:, np.newaxis]
+    if "occupancy" not in tuning_curves.attrs:
+        raise ValueError("No occupancy found in tuning curves.")
+    occupancy = tuning_curves.attrs["occupancy"]
+    occupancy = occupancy / np.nansum(occupancy)  # (D1, D2, ..., Dn)
 
-    fr = np.sum(fx * occupancy, 0)
-    fxfr = fx / fr
+    fx = tuning_curves.values  # (N, D1, D2, ...Dn)
+    fr = tuning_curves.attrs.get("rates") if rates is None else rates  # (N,)
+
+    axes = tuple(range(1, fx.ndim))
+
+    if fr is None:
+        warnings.warn(
+            "Estimating mean firing rates from tuning curves, "
+            "they were not in the tuning curves nor passed.",
+            UserWarning,
+            stacklevel=2,
+        )
+        fr = np.nansum(fx * occupancy, axis=axes)  # (N,)
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        logfx = np.log2(fxfr)
-    logfx[np.isinf(logfx)] = 0.0
-    SI = np.sum(occupancy * fx * logfx, 0)
+        fxfr = fx / np.expand_dims(fr, axis=axes)  # (N, D1, D2, ..., Dn)
+        logfx = np.log2(fxfr)  # (N, D1, D2, ..., Dn)
+    logfx[~np.isfinite(logfx)] = 0.0
 
-    if bitssec:
-        SI = pd.DataFrame(index=columns, columns=["SI"], data=SI)
-        return SI
+    MI_bits_per_sec = np.nansum(occupancy * fx * logfx, axis=axes)  # (N,)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        MI_bits_per_spike = MI_bits_per_sec / fr  # (N,)
+
+    return pd.DataFrame(
+        data=np.stack([MI_bits_per_sec, MI_bits_per_spike], axis=1),
+        index=tuning_curves.coords["unit"],
+        columns=["bits/sec", "bits/spike"],
+    )
+
+
+# =====================================================================================
+# OLD FUNCTIONS, DEPRECATED
+# =====================================================================================
+
+
+def _validate_tuning_inputs(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        # Validate each positional argument
+        sig = inspect.signature(func)
+        kwargs = sig.bind_partial(*args, **kwargs).arguments
+
+        if "feature" in kwargs:
+            if not isinstance(kwargs["feature"], (nap.Tsd, nap.TsdFrame)):
+                raise TypeError(
+                    "feature should be a Tsd (or TsdFrame with 1 column only)"
+                )
+            if (
+                isinstance(kwargs["feature"], nap.TsdFrame)
+                and not kwargs["feature"].shape[1] == 1
+            ):
+                raise ValueError(
+                    "feature should be a Tsd (or TsdFrame with 1 column only)"
+                )
+        if "features" in kwargs:
+            if not isinstance(kwargs["features"], nap.TsdFrame):
+                raise TypeError("features should be a TsdFrame with 2 columns")
+            if not kwargs["features"].shape[1] == 2:
+                raise ValueError("features should have 2 columns only.")
+        if "nb_bins" in kwargs:
+            if not isinstance(kwargs["nb_bins"], (int, tuple)):
+                raise TypeError(
+                    "nb_bins should be of type int (or tuple with (int, int) for 2D tuning curves)."
+                )
+        if "group" in kwargs:
+            if not isinstance(kwargs["group"], nap.TsGroup):
+                raise TypeError("group should be a TsGroup.")
+        if "ep" in kwargs:
+            if not isinstance(kwargs["ep"], nap.IntervalSet):
+                raise TypeError("ep should be an IntervalSet")
+        if "minmax" in kwargs:
+            if not isinstance(kwargs["minmax"], Iterable):
+                raise TypeError("minmax should be a tuple/list of 2 numbers")
+        if "dict_ep" in kwargs:
+            if not isinstance(kwargs["dict_ep"], dict):
+                raise TypeError("dict_ep should be a dictionary of IntervalSet")
+            if not all(
+                isinstance(v, nap.IntervalSet) for v in kwargs["dict_ep"].values()
+            ):
+                raise TypeError("dict_ep argument should contain only IntervalSet.")
+        if "tc" in kwargs:
+            if not isinstance(kwargs["tc"], (pd.DataFrame, np.ndarray)):
+                raise TypeError(
+                    "Argument tc should be of type pandas.DataFrame or numpy.ndarray"
+                )
+        if "dict_tc" in kwargs:
+            if not isinstance(kwargs["dict_tc"], (dict, np.ndarray)):
+                raise TypeError(
+                    "Argument dict_tc should be a dictionary of numpy.ndarray or numpy.ndarray."
+                )
+        if "bitssec" in kwargs:
+            if not isinstance(kwargs["bitssec"], bool):
+                raise TypeError("Argument bitssec should be of type bool")
+        if "tsdframe" in kwargs:
+            if not isinstance(kwargs["tsdframe"], (nap.Tsd, nap.TsdFrame)):
+                raise TypeError("Argument tsdframe should be of type Tsd or TsdFrame.")
+        # Call the original function with validated inputs
+        return func(**kwargs)
+
+    return wrapper
+
+
+@_validate_tuning_inputs
+def compute_1d_tuning_curves(group, feature, nb_bins, ep=None, minmax=None):
+    """
+    .. deprecated:: 0.9.2
+          `compute_1d_tuning_curves` will be removed in Pynapple 1.0.0, it is replaced by
+          `compute_tuning_curves` because the latter works for N dimensions.
+    """
+    warnings.warn(
+        "compute_1d_tuning_curves is deprecated and will be removed in a future version;"
+        "use compute_tuning_curves instead.",
+        FutureWarning,
+        stacklevel=2,
+    )
+    return (
+        compute_tuning_curves(
+            group,
+            feature,
+            nb_bins,
+            range=None if minmax is None else [minmax],
+            epochs=ep,
+        )
+        .to_pandas()
+        .T
+    )
+
+
+@_validate_tuning_inputs
+def compute_1d_tuning_curves_continuous(
+    tsdframe, feature, nb_bins, ep=None, minmax=None
+):
+    """
+    .. deprecated:: 0.9.2
+          `compute_1d_tuning_curves` will be removed in Pynapple 1.0.0, it is replaced by
+          `compute_tuning_curves` because the latter works for N dimensions and continuous data.
+    """
+    warnings.warn(
+        "compute_1d_tuning_curves_continuous is deprecated and will be removed in a future version;"
+        "use compute_tuning_curves instead.",
+        FutureWarning,
+        stacklevel=2,
+    )
+    return (
+        compute_tuning_curves(
+            tsdframe,
+            feature,
+            nb_bins,
+            range=None if minmax is None else [minmax],
+            epochs=ep,
+        )
+        .to_pandas()
+        .T
+    )
+
+
+@_validate_tuning_inputs
+def compute_2d_tuning_curves(group, features, nb_bins, ep=None, minmax=None):
+    """
+    .. deprecated:: 0.9.2
+          `compute_2d_tuning_curves` will be removed in Pynapple 1.0.0, it is replaced by
+          `compute_tuning_curves` because the latter works for N dimensions.
+    """
+    warnings.warn(
+        "compute_2d_tuning_curves is deprecated and will be removed in a future version;"
+        "use compute_tuning_curves instead.",
+        FutureWarning,
+        stacklevel=2,
+    )
+    xarray = compute_tuning_curves(
+        group,
+        features,
+        nb_bins,
+        range=(
+            None if minmax is None else [[minmax[0], minmax[1]], [minmax[2], minmax[3]]]
+        ),
+        epochs=ep,
+    )
+    tcs = {c: xarray.sel(unit=c).values for c in xarray.coords["unit"].values}
+    bins = [xarray.coords[dim].values for dim in xarray.coords if dim != "unit"]
+    return tcs, bins
+
+
+@_validate_tuning_inputs
+def compute_2d_tuning_curves_continuous(
+    tsdframe, features, nb_bins, ep=None, minmax=None
+):
+    """
+    .. deprecated:: 0.9.2
+          `compute_2d_tuning_curves_continuous` will be removed in Pynapple 1.0.0, it is replaced by
+          `compute_tuning_curves` because the latter works for N dimensions and continuous data.
+    """
+    warnings.warn(
+        "compute_2d_tuning_curves_continuous is deprecated and will be removed in a future version;"
+        "use compute_tuning_curves instead.",
+        FutureWarning,
+        stacklevel=2,
+    )
+    xarray = compute_tuning_curves(
+        tsdframe,
+        features,
+        nb_bins,
+        range=(
+            None if minmax is None else [[minmax[0], minmax[1]], [minmax[2], minmax[3]]]
+        ),
+        epochs=ep,
+    )
+    tcs = {c: xarray.sel(unit=c).values for c in xarray.coords["unit"].values}
+    bins = [xarray.coords[dim].values for dim in xarray.coords if dim != "unit"]
+    return tcs, bins
+
+
+@_validate_tuning_inputs
+def compute_discrete_tuning_curves(group, dict_ep):
+    """
+    .. deprecated:: 0.9.2
+          `compute_discrete_tuning_curves` will be removed in Pynapple 1.0.0, it is replaced by
+          `compute_response_per_epoch`.
+    """
+    warnings.warn(
+        "compute_discrete_tuning_curves is deprecated and will be removed in a future version;"
+        "use compute_response_per_epoch instead.",
+        FutureWarning,
+        stacklevel=2,
+    )
+
+    return compute_response_per_epoch(group, dict_ep, return_pandas=True)
+
+
+@_validate_tuning_inputs
+def compute_2d_mutual_info(dict_tc, features, ep=None, minmax=None, bitssec=False):
+    """
+    .. deprecated:: 0.9.2
+          `compute_2d_mutual_info` will be removed in Pynapple 1.0.0, it is replaced by
+          `compute_mutual_information` because the latter works for N dimensions.
+    """
+    warnings.warn(
+        "compute_2d_mutual_info is deprecated and will be removed in a future version;"
+        "use compute_mutual_information instead.",
+        FutureWarning,
+        stacklevel=2,
+    )
+    if type(dict_tc) is dict:
+        tcs = xr.DataArray(
+            np.array([dict_tc[i] for i in dict_tc.keys()]),
+            coords={"unit": list(dict_tc.keys())},
+            dims=["unit", "0", "1"],
+        )
     else:
-        SI = SI / fr
-        SI = pd.DataFrame(index=columns, columns=["SI"], data=SI)
-        return SI
+        tcs = xr.DataArray(
+            dict_tc,
+            coords={"unit": np.arange(len(dict_tc))},
+            dims=["unit", "0", "1"],
+        )
 
-
-def compute_2d_mutual_info(tc, features, ep=None, minmax=None, bitssec=False):
-    """
-    Mutual information as defined in
-
-    Skaggs, W. E., McNaughton, B. L., & Gothard, K. M. (1993).
-    An information-theoretic approach to deciphering the hippocampal code.
-    In Advances in neural information processing systems (pp. 1030-1037).
-
-    Parameters
-    ----------
-    tc : dict or numpy.ndarray
-        If array, first dimension should be the neuron
-    features : TsdFrame
-        The 2 columns features that were used to compute the tuning curves
-    ep : IntervalSet, optional
-        The epoch over which the tuning curves were computed
-        If None, the epoch is the time support of the feature.
-    minmax : tuple or list, optional
-        The min and max boundaries of the tuning curves.
-        If None, the boundaries are inferred from the target features
-    bitssec : bool, optional
-        By default, the function return bits per spikes.
-        Set to true for bits per seconds
-
-    Returns
-    -------
-    pandas.DataFrame
-        Spatial Information (default is bits/spikes)
-    """
-    # A bit tedious here
-    if type(tc) is dict:
-        fx = np.array([tc[i] for i in tc.keys()])
-        idx = list(tc.keys())
-    elif type(tc) is np.ndarray:
-        fx = tc
-        idx = np.arange(len(tc))
-
-    nb_bins = (fx.shape[1] + 1, fx.shape[2] + 1)
-
-    cols = features.columns
-
+    nb_bins = (tcs.shape[1] + 1, tcs.shape[2] + 1)
     bins = []
-    for i, c in enumerate(cols):
+    for i in range(2):
         if minmax is None:
             bins.append(
-                np.linspace(np.min(features[c]), np.max(features[c]), nb_bins[i])
+                np.linspace(
+                    np.nanmin(features[:, i]), np.nanmax(features[:, i]), nb_bins[i]
+                )
             )
         else:
             bins.append(
@@ -330,263 +796,54 @@ def compute_2d_mutual_info(tc, features, ep=None, minmax=None, bitssec=False):
         features = features.restrict(ep)
 
     occupancy, _, _ = np.histogram2d(
-        features[cols[0]].values, features[cols[1]].values, [bins[0], bins[1]]
+        features[:, 0].values.flatten(),
+        features[:, 1].values.flatten(),
+        [bins[0], bins[1]],
     )
     occupancy = occupancy / occupancy.sum()
 
-    fr = np.nansum(fx * occupancy, (1, 2))
-    fr = fr[:, np.newaxis, np.newaxis]
-    fxfr = fx / fr
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        logfx = np.log2(fxfr)
-    logfx[np.isinf(logfx)] = 0.0
-    SI = np.nansum(occupancy * fx * logfx, (1, 2))
+    tcs.attrs["occupancy"] = occupancy
+    MI = compute_mutual_information(tcs)
 
-    if bitssec:
-        SI = pd.DataFrame(index=idx, columns=["SI"], data=SI)
-        return SI
-    else:
-        SI = SI / fr[:, 0, 0]
-        SI = pd.DataFrame(index=idx, columns=["SI"], data=SI)
-        return SI
+    column = "bits/sec" if bitssec else "bits/spike"
+    return MI[[column]].rename({column: "SI"}, axis=1)
 
 
-def compute_1d_tuning_curves_continous(
-    tsdframe, feature, nb_bins, ep=None, minmax=None
-):
+@_validate_tuning_inputs
+def compute_1d_mutual_info(tc, feature, ep=None, minmax=None, bitssec=False):
     """
-    Computes 1-dimensional tuning curves relative to a feature with continous data.
-
-    Parameters
-    ----------
-    tsdframe : Tsd or TsdFrame
-        Input data (e.g. continus calcium data
-        where each column is the calcium activity of one neuron)
-    feature : Tsd
-        The feature (one column)
-    nb_bins : int
-        Number of bins in the tuning curves
-    ep : IntervalSet, optional
-        The epoch on which tuning curves are computed.
-        If None, the epoch is the time support of the feature.
-    minmax : tuple or list, optional
-        The min and max boundaries of the tuning curves.
-        If None, the boundaries are inferred from the target feature
-
-    Returns
-    -------
-    pandas.DataFrame
-        DataFrame to hold the tuning curves
-
-    Raises
-    ------
-    RuntimeError
-        If tsdframe is not a Tsd or a TsdFrame object.
-
+    .. deprecated:: 0.9.2
+          `compute_1d_mutual_info` will be removed in Pynapple 1.0.0, it is replaced by
+          `compute_mutual_information` because the latter works for N dimensions.
     """
-    if not isinstance(tsdframe, (nap.Tsd, nap.TsdFrame)):
-        raise RuntimeError("Unknown format for tsdframe.")
-
-    if isinstance(ep, nap.IntervalSet):
-        feature = feature.restrict(ep)
-        tsdframe = tsdframe.restrict(ep)
-    else:
-        tsdframe = tsdframe.restrict(feature.time_support)
-
-    if minmax is None:
-        bins = np.linspace(np.min(feature), np.max(feature), nb_bins + 1)
-    else:
-        bins = np.linspace(minmax[0], minmax[1], nb_bins + 1)
-
-    align_times = tsdframe.value_from(feature)
-    idx = np.digitize(align_times.values, bins) - 1
-    tmp = pd.DataFrame(tsdframe).groupby(idx).mean()
-    tmp = tmp.reindex(np.arange(0, len(bins) - 1))
-    tmp.index = pd.Index(bins[0:-1] + np.diff(bins) / 2)
-
-    tmp = tmp.fillna(0)
-
-    return pd.DataFrame(tmp)
-
-
-def compute_2d_tuning_curves_continuous(
-    tsdframe, features, nb_bins, ep=None, minmax=None
-):
-    """
-    Computes 2-dimensional tuning curves relative to a 2d feature with continous data.
-
-    Parameters
-    ----------
-    tsdframe : Tsd or TsdFrame
-        Input data (e.g. continuous calcium data
-        where each column is the calcium activity of one neuron)
-    features : TsdFrame
-        The 2d feature (two columns)
-    nb_bins : int or tuple
-        Number of bins in the tuning curves (separate for 2 feature dimensions if tuple provided)
-    ep : IntervalSet, optional
-        The epoch on which tuning curves are computed.
-        If None, the epoch is the time support of the feature.
-    minmax : tuple or list, optional
-        The min and max boundaries of the tuning curves.
-        Should be a tuple of minx, maxx, miny, maxy
-        If None, the boundaries are inferred from the target feature
-
-    Returns
-    -------
-    tuple
-        A tuple containing: \n
-        tc (dict): Dictionnary of the tuning curves with dimensions (nb_bins, nb_bins).\n
-        xy (list): List of bins center in the two dimensions
-
-    Raises
-    ------
-    RuntimeError
-        If tsdframe is not a Tsd/TsdFrame or if features is not 2 columns
-
-    """
-    if not isinstance(tsdframe, (nap.Tsd, nap.TsdFrame)):
-        raise RuntimeError("Unknown format for tsdframe.")
-
-    if not isinstance(features, nap.TsdFrame):
-        raise RuntimeError("Unknown format for features.")
-
-    if isinstance(ep, nap.IntervalSet):
-        features = features.restrict(ep)
-        tsdframe = tsdframe.restrict(ep)
-    else:
-        tsdframe = tsdframe.restrict(features.time_support)
-
-    if features.shape[1] != 2:
-        raise RuntimeError("features input is not 2 columns.")
-
-    if isinstance(nb_bins, int):
-        nb_bins = (nb_bins, nb_bins)
-    elif len(nb_bins) != 2:
-        raise RuntimeError("nb_bins should be int or tuple of 2 ints")
-
-    cols = list(features.columns)
-
-    binsxy = {}
-    idxs = {}
-
-    for i, c in enumerate(cols):
-        if minmax is None:
-            bins = np.linspace(np.min(features[c]), np.max(features[c]), nb_bins[i] + 1)
-        else:
-            bins = np.linspace(minmax[i + i % 2], minmax[i + 1 + i % 2], nb_bins[i] + 1)
-
-        align_times = tsdframe.value_from(features[c], ep)
-        idxs[c] = np.digitize(align_times.values, bins) - 1
-        binsxy[c] = bins
-
-    idxs = pd.DataFrame(idxs)
-
-    tc_np = np.zeros((tsdframe.shape[1], nb_bins[0], nb_bins[1])) * np.nan
-
-    for k, tmp in idxs.groupby(cols):
-        if (0 <= k[0] < nb_bins[0]) and (0 <= k[1] < nb_bins[1]):
-            tc_np[:, k[0], k[1]] = tsdframe.iloc[tmp.index].mean(0).values
-
-    tc_np[np.isnan(tc_np)] = 0.0
-
-    xy = [binsxy[c][0:-1] + np.diff(binsxy[c]) / 2 for c in binsxy.keys()]
-
-    tc = {c: tc_np[i] for i, c in enumerate(tsdframe.columns)}
-
-    return tc, xy
-
-
-def compute_1d_poisson_glm(
-    group, feature, binsize, windowsize, ep, time_units="s", niter=100, tolerance=1e-5
-):
-    """
-    Poisson GLM
-
-    Warning : this function is still experimental!
-
-    Parameters
-    ----------
-    group : TsGroup
-        Spike trains
-    feature : Tsd
-        The regressors
-    binsize : float
-        Bin size
-    windowsize : Float
-        The window for offsetting the regressors
-    ep : IntervalSet, optional
-        On which epoch to perfom the GLM
-    time_units : str, optional
-        Time units of binsize and windowsize
-    niter : int, optional
-        Number of iteration for fitting the GLM
-    tolerance : float, optional
-        Tolerance for stopping the IRLS
-
-    Returns
-    -------
-    tuple
-        regressors : TsdFrame\n
-        offset : pandas.Series\n
-        prediction : TsdFrame\n
-
-    Raises
-    ------
-    RuntimeError
-        if group is not a TsGroup
-
-    """
-    if type(group) is nap.TsGroup:
-        newgroup = group.restrict(ep)
-    else:
-        raise RuntimeError("Unknown format for group")
-
-    binsize = nap.format_timestamps(binsize, time_units)[0]
-    windowsize = nap.format_timestamps(windowsize, time_units)[0]
-
-    # Bin the spike train
-    count = newgroup.count(binsize)
-
-    # Downsample the feature to binsize
-    tidx = []
-    dfeat = []
-    for i in ep.index:
-        bins = np.arange(ep.start[i], ep.end[i] + binsize, binsize)
-        idx = np.digitize(feature.index.values, bins) - 1
-        tmp = feature.groupby(idx).mean()
-        tidx.append(bins[0:-1] + np.diff(bins) / 2)
-        dfeat.append(tmp)
-    dfeat = nap.Tsd(t=np.hstack(tidx), d=np.hstack(dfeat), time_support=ep)
-
-    # Build the Hankel matrix
-    nt = np.abs(windowsize // binsize).astype("int") + 1
-    X = hankel(
-        np.hstack((np.zeros(nt - 1), dfeat.values))[: -nt + 1], dfeat.values[-nt:]
+    warnings.warn(
+        "compute_1d_mutual_info is deprecated and will be removed in a future version;"
+        "use compute_mutual_information instead.",
+        FutureWarning,
+        stacklevel=2,
     )
-    X = np.hstack((np.ones((len(dfeat), 1)), X))
-
-    # Fitting GLM for each neuron
-    regressors = []
-    for i, n in enumerate(group.keys()):
-        print("Fitting Poisson GLM for unit %i" % n)
-        b = nap.jitted_functions.jit_poisson_IRLS(
-            X, count[n].values, niter=niter, tolerance=tolerance
+    if isinstance(tc, pd.DataFrame):
+        tcs = xr.DataArray(
+            tc.values.T, coords={"unit": tc.columns.values, "0": tc.index}
         )
-        regressors.append(b)
+    else:
+        tcs = xr.DataArray(
+            tc.T, coords={"unit": np.arange(tc.shape[1])}, dims=["unit", "0"]
+        )
 
-    regressors = np.array(regressors).T
-    offset = regressors[0]
-    regressors = regressors[1:]
-    regressors = nap.TsdFrame(
-        t=np.arange(-nt + 1, 1) * binsize, d=regressors, columns=list(group.keys())
-    )
-    offset = pd.Series(index=group.keys(), data=offset)
+    nb_bins = tc.shape[0] + 1
+    if minmax is None:
+        bins = np.linspace(np.nanmin(feature), np.nanmax(feature), nb_bins)
+    else:
+        bins = np.linspace(minmax[0], minmax[1], nb_bins)
 
-    prediction = nap.TsdFrame(
-        t=dfeat.index.values,
-        d=np.exp(np.dot(X[:, 1:], regressors.values) + offset.values) * binsize,
-    )
+    if isinstance(ep, nap.IntervalSet):
+        occupancy, _ = np.histogram(feature.restrict(ep).values, bins)
+    else:
+        occupancy, _ = np.histogram(feature.values, bins)
+    occupancy = occupancy / occupancy.sum()
+    tcs.attrs["occupancy"] = occupancy
+    MI = compute_mutual_information(tcs)
 
-    return (regressors, offset, prediction)
+    column = "bits/sec" if bitssec else "bits/spike"
+    return MI[[column]].rename({column: "SI"}, axis=1)

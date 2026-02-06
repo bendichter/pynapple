@@ -1,16 +1,53 @@
-# -*- coding: utf-8 -*-
-# @Author: gviejo
-# @Date:   2022-01-30 22:59:00
-# @Last Modified by:   gviejo
-# @Last Modified time: 2022-11-17 17:16:16
+"""
+Functions to realign time series relative to a reference time.
+"""
+
+import inspect
+from functools import wraps
+from numbers import Number
 
 import numpy as np
-from scipy.linalg import hankel
 
 from .. import core as nap
+from ._process_functions import (
+    _perievent_continuous,
+    _perievent_trigger_average,
+)
 
 
-def _align_tsd(tsd, tref, window, time_support):
+def _validate_perievent_inputs(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        # Validate each positional argument
+        sig = inspect.signature(func)
+        kwargs = sig.bind_partial(*args, **kwargs).arguments
+
+        parameters_type = {
+            "timestamps": (nap.Ts, nap.Tsd, nap.TsdFrame, nap.TsdTensor, nap.TsGroup),
+            "timeseries": (nap.Tsd, nap.TsdFrame, nap.TsdTensor),
+            "tref": (nap.Ts, nap.Tsd, nap.TsdFrame, nap.TsdTensor),
+            "group": (nap.TsGroup,),
+            "ep": (nap.IntervalSet,),
+            "feature": (nap.Tsd, nap.TsdFrame, nap.TsdTensor),
+            "binsize": (Number,),
+            "windowsize": (tuple, Number),
+            "minmax": (tuple, Number),
+            "time_unit": (str,),
+        }
+        for param, param_type in parameters_type.items():
+            if param in kwargs:
+                if not isinstance(kwargs[param], param_type):
+                    raise TypeError(
+                        f"Invalid type. Parameter {param} must be of type {[p.__name__ for p in param_type]}."
+                    )
+
+        # Call the original function with validated inputs
+        return func(**kwargs)
+
+    return wrapper
+
+
+def _align_tsd(tsd, tref, window, new_time_support):
     """
     Helper function compiled with numba for aligning times.
     See compute_perievent for using this function
@@ -23,7 +60,7 @@ def _align_tsd(tsd, tref, window, time_support):
         The data to align
     tref : numpy.ndarray
         The reference times
-    windowsize : tuple
+    window : tuple
         Start and end of the window size around tref
 
     Returns
@@ -31,41 +68,45 @@ def _align_tsd(tsd, tref, window, time_support):
     list
         The align times and data
     """
-    lbounds = np.searchsorted(tsd.index.values, tref.index.values - window[0])
-    rbounds = np.searchsorted(tsd.index.values, tref.index.values + window[1])
+    lbounds = np.searchsorted(tsd.index, tref.index - window[0])
+    rbounds = np.searchsorted(tsd.index, tref.index + window[1])
 
     group = {}
 
     if isinstance(tsd, nap.Ts):
-        for i in range(tref.shape[0]):
-            tmp = tsd.index.values[lbounds[i] : rbounds[i]] - tref.index.values[i]
-            group[i] = nap.Ts(t=tmp, time_support=time_support)
+        for i in range(len(tref)):
+            tmp = tsd.index[lbounds[i] : rbounds[i]] - tref.index[i]
+            group[i] = nap.Ts(t=tmp, time_support=new_time_support)
     else:
-        for i in range(tref.shape[0]):
-            tmp = tsd.index.values[lbounds[i] : rbounds[i]] - tref.index.values[i]
+        for i in range(len(tref)):
+            tmp = tsd.index[lbounds[i] : rbounds[i]] - tref.index[i]
             tmp2 = tsd.values[lbounds[i] : rbounds[i]]
-            group[i] = nap.Tsd(t=tmp, d=tmp2, time_support=time_support)
+            group[i] = nap.Tsd(t=tmp, d=tmp2, time_support=new_time_support)
 
-    group = nap.TsGroup(group, time_support=time_support, bypass_check=True)
-    group.set_info(ref_times=tref.index.values)
+    group = nap.TsGroup(group, time_support=new_time_support, bypass_check=True)
+    group.set_info(ref_times=tref.index)
 
     return group
 
 
-def compute_perievent(data, tref, minmax, time_unit="s"):
+@_validate_perievent_inputs
+def compute_perievent(timestamps, tref, minmax, time_unit="s", **kwargs):
     """
-    Center ts/tsd/tsgroup object around the timestamps given by the tref argument.
-    minmax indicates the start and end of the window.
+    Center the timestamps of a time series object or a time series group around the timestamps given by the `tref` argument.
+    `minmax` indicates the start and end of the window. If `minmax=(-5, 10)`, the window will be from -5 second to 10 second.
+    If `minmax=10`, the window will be from -10 second to 10 second.
+
+    To center the values of a time series around a set of timestamps, you can use `compute_perievent_continuous`.
 
     Parameters
     ----------
-    data : Ts/Tsd/TsGroup
-        The data to align to tref.
-        If Ts/Tsd, returns a TsGroup.
-        If TsGroup, returns a dictionnary of TsGroup
-    tref : Ts/Tsd
-        The timestamps of the event to align to
-    minmax : tuple or int or float
+    timestamps : Ts, Tsd, TsdFrame, TsdTensor or TsGroup
+        The timestamps to align to tref.
+        If Ts/Tsd/TsdFrame/TsdTensor, returns a TsGroup.
+        If TsGroup, returns a dictionary of TsGroup
+    tref : Ts, Tsd, TsdFrame or TsdTensor.
+        The time reference of the event to align to
+    minmax : tuple of int/float or int or float
         The window size. Can be unequal on each side i.e. (-500, 1000).
     time_unit : str, optional
         Time units of the minmax ('s' [default], 'ms', 'us').
@@ -73,111 +114,219 @@ def compute_perievent(data, tref, minmax, time_unit="s"):
     Returns
     -------
     dict
-        A TsGroup if data is a Ts/Tsd or
-        a dictionnary of TsGroup if data is a TsGroup.
+        A TsGroup if timestamps is a Ts/Tsd/TsdFrame/TsdTensor or
+        a dictionary of TsGroup if timestamps is a TsGroup.
 
     Raises
     ------
     RuntimeError
-        if tref is not a Ts/Tsd object or if data is not a Ts/Tsd or TsGroup
+        If `time_unit` not in ["s", "ms", "us"]
+        If `minmax` is wrongly defined
     """
-    if not isinstance(tref, (nap.Ts, nap.Tsd)):
-        raise RuntimeError("tref should be a Tsd object.")
+    if time_unit not in ["s", "ms", "us"]:
+        raise RuntimeError("time_unit should be 's', 'ms' or 'us'")
 
-    if isinstance(minmax, float) or isinstance(minmax, int):
+    if isinstance(minmax, Number):
         minmax = np.array([minmax, minmax], dtype=np.float64)
 
-    window = np.abs(nap.format_timestamps(np.array(minmax), time_unit))
+    if len(minmax) != 2:
+        raise RuntimeError("minmax should be a tuple of 2 numbers or a single number.")
+
+    if not all([isinstance(x, Number) for x in minmax]):
+        raise RuntimeError("minmax should be a tuple of 2 numbers or a single number.")
+
+    window = np.abs(nap.TsIndex.format_timestamps(np.array(minmax), time_unit))
+
+    new_time_support = nap.IntervalSet(start=-window[0], end=window[1])
+
+    if isinstance(timestamps, nap.TsGroup):
+        toreturn = {}
+        for n in timestamps.index:
+            toreturn[n] = _align_tsd(timestamps[n], tref, window, new_time_support)
+        return toreturn
+    else:
+        return _align_tsd(timestamps, tref, window, new_time_support)
+
+
+@_validate_perievent_inputs
+def compute_perievent_continuous(
+    timeseries, tref, minmax, ep=None, time_unit="s", **kwargs
+):
+    """
+    Center continuous time series around the timestamps given by the 'tref' argument.
+    `minmax` indicates the start and end of the window. If `minmax=(-5, 10)`, the window will be from -5 second to 10 second.
+    If `minmax=10`, the window will be from -10 second to 10 second.
+
+    To realign timestamps around a set of timestamps, you can use `compute_perievent`.
+
+    This function assumes a constant sampling rate of the time series.
+
+    Parameters
+    ----------
+    timeseries : Tsd, TsdFrame or TsdTensor
+        The time series to align to tref.
+    tref : Ts, Tsd, TsdFrame or TsdTensor
+        The time reference of the event to align to
+    minmax : tuple of int/float or int or float
+        The window size. Can be unequal on each side i.e. (-500, 1000).
+    ep : IntervalSet, optional
+        The epochs to perform the operation. If None, the default is the time support of the data.
+    time_unit : str, optional
+        Time units of the minmax ('s' [default], 'ms', 'us').
+
+    Returns
+    -------
+    TsdFrame, TsdTensor
+        If `data` is a one-dimensional Tsd, the output is a TsdFrame. Each column is one timestamps from `tref`.
+        If `data` is a TsdFrame or TsdTensor, the output is a TsdTensor with one more dimension. The first dimension is always time and the second dimension is the 'tref' timestamps.
+
+    Raises
+    ------
+    RuntimeError
+        If `time_unit` not in ["s", "ms", "us"]
+    """
+    if time_unit not in ["s", "ms", "us"]:
+        raise RuntimeError("time_unit should be 's', 'ms' or 'us'")
+
+    if isinstance(minmax, Number):
+        minmax = np.array([minmax, minmax], dtype=np.float64)
+
+    if len(minmax) != 2:
+        raise RuntimeError("minmax should be a tuple of 2 numbers or a single number.")
+
+    if not all([isinstance(x, Number) for x in minmax]):
+        raise RuntimeError("minmax should be a tuple of 2 numbers or a single number.")
+
+    if ep is None:
+        ep = timeseries.time_support
+
+    window = np.abs(nap.TsIndex.format_timestamps(np.array(minmax), time_unit))
+
+    time_array = timeseries.index.values
+    data_array = timeseries.values
+    time_target_array = tref.index.values
+    starts = ep.start
+    ends = ep.end
+
+    bin_size = time_array[1] - time_array[0]
+    idx1 = -np.arange(0, window[0] + bin_size, bin_size)[::-1][:-1]
+    idx2 = np.arange(0, window[1] + bin_size, bin_size)[1:]
+    time_idx = np.hstack((idx1, np.zeros(1), idx2))
+    minmax = np.array([idx1.shape[0], idx2.shape[0]])
+
+    new_data_array = _perievent_continuous(
+        time_array, data_array, time_target_array, starts, ends, minmax
+    )
 
     time_support = nap.IntervalSet(start=-window[0], end=window[1])
 
-    if isinstance(data, nap.TsGroup):
-        toreturn = {}
-
-        for n in data.index:
-            toreturn[n] = _align_tsd(data[n], tref, window, time_support)
-
-        return toreturn
-
-    elif isinstance(data, (nap.Ts, nap.Tsd)):
-        return _align_tsd(data, tref, window, time_support)
-
+    if new_data_array.ndim == 2:
+        return nap.TsdFrame(t=time_idx, d=new_data_array, time_support=time_support)
     else:
-        raise RuntimeError("Unknown format for data")
+        return nap.TsdTensor(t=time_idx, d=new_data_array, time_support=time_support)
 
 
+@_validate_perievent_inputs
 def compute_event_trigger_average(
-    group, feature, binsize, windowsize, ep, time_units="s"
+    group,
+    feature,
+    binsize,
+    windowsize=0,
+    ep=None,
+    time_unit="s",
 ):
     """
-    Bin the spike train in binsize and compute the Spike Trigger Average (STA) within windowsize.
-    If C is the spike count matrix and feature is a Tsd array, the function computes
+    Bin the event timestamps within bin_size and compute the Event-Triggered Average (ETA) within `windowsize`.
+    If C is the event count matrix and `feature` is a Tsd array, the function computes
     the Hankel matrix H from windowsize=(-t1,+t2) by offseting the Tsd array.
 
-    The STA is then defined as the dot product between H and C divided by the number of spikes.
+    The ETA is then defined as the dot product between H and C divided by the number of events.
+
+    The object `feature` can be any dimensions.
 
     Parameters
     ----------
     group : TsGroup
         The group of Ts/Tsd objects that hold the trigger time.
-    feature : Tsd
-        The 1-dimensional feature to average
-    binsize : float
+    feature : Tsd, TsdFrame or TsdTensor
+        The feature to average.
+    binsize : float or int
         The bin size. Default is second.
-        If different, specify with the parameter time_units ('s' [default], 'ms', 'us').
-    windowsize : float
-        The window size. Default is second.
-        If different, specify with the parameter time_units ('s' [default], 'ms', 'us').
-    ep : IntervalSet
-        The epoch on which STA are computed
-    time_units : str, optional
-        The time units of the parameters. They have to be consistent for binsize and windowsize.
+        If different, specify with the parameter time_unit ('s' [default], 'ms', 'us').
+    windowsize : tuple of float/int or float/int, optional
+        The window size. Default is second. For example windowsize = (-1, 1) is equivalent to windowsize = 1
+        If different, specify with the parameter time_unit ('s' [default], 'ms', 'us').
+        Default is (0, 0)
+    ep : IntervalSet, optional
+        The epochs on which the average is computed. If None, the time support of the feature is used.
+    time_unit : str, optional
+        The time unit of the parameters. They have to be consistent for binsize and windowsize.
         ('s' [default], 'ms', 'us').
-
-    Returns
-    -------
-    TsdFrame
-        A TsdFrame of Spike-Trigger Average. Each column is an element from the group.
-
-    Raises
-    ------
-    RuntimeError
-        if group is not a Ts/Tsd or TsGroup
     """
-    if type(group) is not nap.TsGroup:
-        raise RuntimeError("Unknown format for group")
+    if time_unit not in ["s", "ms", "us"]:
+        raise RuntimeError("time_unit should be 's', 'ms' or 'us'")
 
-    binsize = nap.format_timestamps(np.array([binsize], dtype=np.float64), time_units)[
-        0
-    ]
+    if isinstance(windowsize, Number):
+        windowsize = np.array([windowsize, windowsize], dtype=np.float64)
+
+    if len(windowsize) != 2:
+        raise RuntimeError(
+            "windowsize should be a tuple of 2 numbers or a single number."
+        )
+
+    if not all([isinstance(x, Number) for x in windowsize]):
+        raise RuntimeError(
+            "windowsize should be a tuple of 2 numbers or a single number."
+        )
+
+    if ep is None:
+        ep = feature.time_support
+
+    binsize = nap.TsIndex.format_timestamps(
+        np.array([binsize], dtype=np.float64), time_unit
+    )[0]
     start = np.abs(
-        nap.format_timestamps(np.array([windowsize[0]], dtype=np.float64), time_units)[
-            0
-        ]
+        nap.TsIndex.format_timestamps(
+            np.array([windowsize[0]], dtype=np.float64), time_unit
+        )[0]
     )
     end = np.abs(
-        nap.format_timestamps(np.array([windowsize[1]], dtype=np.float64), time_units)[
-            0
-        ]
+        nap.TsIndex.format_timestamps(
+            np.array([windowsize[1]], dtype=np.float64), time_unit
+        )[0]
     )
+
     idx1 = -np.arange(0, start + binsize, binsize)[::-1][:-1]
     idx2 = np.arange(0, end + binsize, binsize)[1:]
     time_idx = np.hstack((idx1, np.zeros(1), idx2))
 
+    # eta = np.zeros((time_idx.shape[0], len(group), *feature.shape[1:]))
+
+    windows = np.array([len(idx1), len(idx2)])
+
+    # Bin the spike train
     count = group.count(binsize, ep)
 
-    tmp = feature.bin_average(binsize, ep)
+    time_target_array = np.round(count.index.values - (binsize / 2), 9)
+    count_array = count.values
+    starts = ep.start
+    ends = ep.end
 
-    # Build the Hankel matrix
-    n_p = len(idx1)
-    n_f = len(idx2)
-    pad_tmp = np.pad(tmp, (n_p, n_f))
-    offset_tmp = hankel(pad_tmp, pad_tmp[-(n_p + n_f + 1) :])[0 : len(tmp)]
+    time_array = feature.index.values
+    data_array = feature.values
 
-    sta = np.dot(offset_tmp.T, count.values)
+    eta = _perievent_trigger_average(
+        time_target_array,
+        count_array,
+        time_array,
+        data_array,
+        starts,
+        ends,
+        windows,
+        binsize,
+    )
 
-    sta = sta / count.sum(0).values
-
-    sta = nap.TsdFrame(t=time_idx, d=sta, columns=group.index)
-
-    return sta
+    if eta.ndim == 2:
+        return nap.TsdFrame(t=time_idx, d=eta, columns=group.index)
+    else:
+        return nap.TsdTensor(t=time_idx, d=eta)

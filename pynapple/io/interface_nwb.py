@@ -1,31 +1,99 @@
-# -*- coding: utf-8 -*-
-# @Author: Guillaume Viejo
-# @Date:   2023-08-01 11:54:45
-# @Last Modified by:   gviejo
-# @Last Modified time: 2023-08-07 22:34:26
-
 """
 Pynapple class to interface with NWB files.
 Data are always lazy-loaded.
-Object behaves like dictionnary.
+Object behaves like dictionary.
 """
 
 import errno
+import importlib
 import os
 import warnings
 from collections import UserDict
+from numbers import Number
+from pathlib import Path
 
 import numpy as np
-import pynwb
-from pynwb import NWBHDF5IO
-from rich.console import Console
-from rich.table import Table
+from tabulate import tabulate
 
 from .. import core as nap
 
 
+def _get_unique_identifier(full_path_to_key):
+    out, count = np.unique(list(full_path_to_key.values()), return_counts=True)
+    if len(out) != len(full_path_to_key):
+        key_to_change = out[count > 1]
+        # Filter for ambiguous keys only
+        update_dict = {
+            key: val
+            for key, val in full_path_to_key.items()
+            if full_path_to_key[key] in key_to_change
+        }
+        for full_path, key in update_dict.items():
+            # Adding the most immediate parent path until disambiguation
+            base_parts = full_path.split("/")
+            relative_parts = key.split("/")
+            new_key = "/".join(base_parts[-len(relative_parts) - 1 :])
+            if new_key.startswith("/"):
+                new_key = new_key[1:]
+            update_dict[full_path] = new_key
+        update_dict = _get_unique_identifier(update_dict)
+        full_path_to_key.update(update_dict)
+    return full_path_to_key
+
+
+def _get_full_path(path, obj):
+    if hasattr(obj, "parent"):  # Better be safe here
+        if obj.parent is None:
+            return "/" + path
+        else:
+            if hasattr(obj.parent, "name"):  # and extra safe
+                if obj.parent.name == "root":
+                    return "/" + path
+                else:
+                    return _get_full_path(obj.parent.name + "/" + path, obj.parent)
+            else:
+                return "/" + path
+    else:
+        return "/" + path
+
+
+def iterate_over_nwb(nwbfile):
+    pynwb = importlib.import_module("pynwb")
+    for oid, obj in nwbfile.objects.items():
+        if isinstance(obj, pynwb.misc.DynamicTable) and any(
+            [i.name.endswith("_times_index") for i in obj.columns]
+        ):
+            # data["units"] = {"id": oid, "type": "TsGroup"}
+            yield obj, {"id": oid, "type": "TsGroup"}
+
+        elif isinstance(obj, pynwb.epoch.TimeIntervals):
+            # Supposedly IntervalsSets
+            yield obj, {"id": oid, "type": "IntervalSet"}
+
+        elif isinstance(obj, pynwb.misc.DynamicTable) and any(
+            [i.name.endswith("_times") for i in obj.columns]
+        ):
+            # Supposedly Timestamps
+            yield obj, {"id": oid, "type": "Ts"}
+
+        elif isinstance(obj, pynwb.misc.AnnotationSeries):
+            # Old timestamps version
+            yield obj, {"id": oid, "type": "Ts"}
+
+        elif isinstance(obj, pynwb.misc.TimeSeries):
+            if len(obj.data.shape) > 2:
+                yield obj, {"id": oid, "type": "TsdTensor"}
+
+            elif len(obj.data.shape) == 2:
+                yield obj, {"id": oid, "type": "TsdFrame"}
+
+            elif len(obj.data.shape) == 1:
+                yield obj, {"id": oid, "type": "Tsd"}
+
+
 def _extract_compatible_data_from_nwbfile(nwbfile):
-    """Extract all the NWB objects that can be converted to a pynapple object.
+    """Extract all the NWB objects that can be converted to a pynapple object. If two objects have the same names, they
+    are distinguished by adding their module name to their path.
 
     Parameters
     ----------
@@ -35,41 +103,14 @@ def _extract_compatible_data_from_nwbfile(nwbfile):
     Returns
     -------
     dict
-        Dictionnary containing all the object found and their type in pynapple.
+        Dictionary containing all the object found and their type in pynapple.
     """
-    data = {}
-
-    for oid, obj in nwbfile.objects.items():
-        if isinstance(obj, pynwb.misc.DynamicTable) and any(
-            [i.name.endswith("_times_index") for i in obj.columns]
-        ):
-            data["units"] = {"id": oid, "type": "TsGroup"}
-
-        elif isinstance(obj, pynwb.epoch.TimeIntervals):
-            # Supposedly IntervalsSets
-            data[obj.name] = {"id": oid, "type": "IntervalSet"}
-
-        elif isinstance(obj, pynwb.misc.DynamicTable) and any(
-            [i.name.endswith("_times") for i in obj.columns]
-        ):
-            # Supposedly Timestamps
-            data[obj.name] = {"id": oid, "type": "Ts"}
-
-        elif isinstance(obj, pynwb.misc.AnnotationSeries):
-            # Old timestamps version
-            data[obj.name] = {"id": oid, "type": "Ts"}
-
-        elif isinstance(obj, pynwb.misc.TimeSeries):
-            if len(obj.data.shape) == 2:
-                data[obj.name] = {"id": oid, "type": "TsdFrame"}
-
-            elif len(obj.data.shape) == 1:
-                data[obj.name] = {"id": oid, "type": "Tsd"}
-
-    return data
+    return {
+        _get_full_path(obj.name, obj): out for obj, out in iterate_over_nwb(nwbfile)
+    }
 
 
-def _make_interval_set(obj):
+def _make_interval_set(obj, **kwargs):
     """Helper function to make IntervalSet
 
     Parameters
@@ -87,51 +128,24 @@ def _make_interval_set(obj):
         df = obj.to_dataframe()
 
         if hasattr(df, "start_time") and hasattr(df, "stop_time"):
-            if df.shape[1] == 2:
-                data = nap.IntervalSet(start=df["start_time"], end=df["stop_time"])
-                return data
+            df = df.rename(columns={"start_time": "start", "stop_time": "end"})
+            # create from full dataframe to ensure that metadata is associated correctly
+            data = nap.IntervalSet(df)
+            return data
 
-            group_by_key = None
-            if "tags" in df.columns:
-                group_by_key = "tags"
-
-            elif df.shape[1] == 3:  # assuming third column is the tag
-                group_by_key = df.columns[2]
-
-            if group_by_key:
-                for i in df.index:
-                    if isinstance(df.loc[i, group_by_key], (list, tuple, np.ndarray)):
-                        df.loc[i, group_by_key] = "-".join(
-                            [str(j) for j in df.loc[i, group_by_key]]
-                        )
-
-                data = {}
-                for k, subdf in df.groupby(group_by_key):
-                    data[k] = nap.IntervalSet(
-                        start=subdf["start_time"], end=subdf["stop_time"]
-                    )
-                if len(data) == 1:
-                    return data[list(data.keys())[0]]
-                else:
-                    return data
-
-            else:
-                warnings.warn(
-                    "Too many metadata. Returning pandas.DataFrame, not IntervalSet",
-                    stacklevel=2,
-                )
-                return df  # Too many metadata to split the epoch
     else:
         return obj
 
 
-def _make_tsd(obj):
+def _make_tsd(obj, lazy_loading=True):
     """Helper function to make Tsd
 
     Parameters
     ----------
     obj : pynwb.misc.TimeSeries
         NWB object
+    lazy_loading: bool
+        If True return a memory-view of the data, load otherwise.
 
     Returns
     -------
@@ -139,32 +153,71 @@ def _make_tsd(obj):
 
     """
 
-    d = obj.data[:]
+    d = obj.data
+    if not lazy_loading:
+        d = d[:]
+
     if obj.timestamps is not None:
         t = obj.timestamps[:]
     else:
         t = obj.starting_time + np.arange(obj.num_samples) / obj.rate
 
-    data = nap.Tsd(t=t, d=d)
+    data = nap.Tsd(t=t, d=d, load_array=not lazy_loading)
 
     return data
 
 
-def _make_tsd_frame(obj):
+def _make_tsd_tensor(obj, lazy_loading=True):
+    """Helper function to make TsdTensor
+
+    Parameters
+    ----------
+    obj : pynwb.misc.TimeSeries
+        NWB object
+    lazy_loading: bool
+        If True return a memory-view of the data, load otherwise.
+
+    Returns
+    -------
+    Tsd
+
+    """
+
+    d = obj.data
+    if not lazy_loading:
+        d = d[:]
+
+    if obj.timestamps is not None:
+        t = obj.timestamps[:]
+    else:
+        t = obj.starting_time + np.arange(obj.num_samples) / obj.rate
+
+    data = nap.TsdTensor(t=t, d=d, load_array=not lazy_loading)
+
+    return data
+
+
+def _make_tsd_frame(obj, lazy_loading=True):
     """Helper function to make TsdFrame
 
     Parameters
     ----------
     obj : pynwb.misc.TimeSeries
         NWB object
+    lazy_loading: bool
+        If True return a memory-view of the data, load otherwise.
 
     Returns
     -------
     Tsd
 
     """
+    pynwb = importlib.import_module("pynwb")
 
-    d = obj.data[:]
+    d = obj.data
+    if not lazy_loading:
+        d = d[:]
+
     if obj.timestamps is not None:
         t = obj.timestamps[:]
     else:
@@ -181,7 +234,11 @@ def _make_tsd_frame(obj):
     elif isinstance(obj, pynwb.ecephys.ElectricalSeries):
         # (channel mapping)
         try:
-            columns = obj.electrodes["id"][:]
+            df = obj.electrodes.to_dataframe()
+            if hasattr(df, "label"):
+                columns = df["label"].values
+            else:
+                columns = df.index.values
         except Exception:
             columns = np.arange(obj.data.shape[1])
 
@@ -200,12 +257,12 @@ def _make_tsd_frame(obj):
     else:
         columns = np.arange(obj.data.shape[1])
 
-    data = nap.TsdFrame(t=t, d=d, columns=columns)
+    data = nap.TsdFrame(t=t, d=d, columns=columns, load_array=not lazy_loading)
 
     return data
 
 
-def _make_tsgroup(obj):
+def _make_tsgroup(obj, **kwargs):
     """Helper function to make TsGroup
 
     Parameters
@@ -218,7 +275,7 @@ def _make_tsgroup(obj):
     TsGroup
 
     """
-
+    pynwb = importlib.import_module("pynwb")
     index = obj.id[:]
     tsgroup = {}
     for i, gr in zip(index, obj.spike_times_index[:]):
@@ -228,18 +285,48 @@ def _make_tsgroup(obj):
 
     N = len(tsgroup)
     metainfo = {}
-    for colname, col in zip(obj.colnames, obj.columns):
-        if colname not in ["spike_times_index", "spike_times"]:
-            if len(col) == N:
-                if not isinstance(col[0], (np.ndarray, list, tuple, dict, set)):
-                    metainfo[colname] = np.array(col[:])
+    for coln in obj.colnames:
+        if coln == "electrode_group":
+            for e in [
+                "location",
+                "x",
+                "y",
+                "z",
+                "imp",
+                "filtering",
+                "rel_x",
+                "rel_y",
+                "rel_z",
+                "reference",
+            ]:
+                tmp = [eg.__getattribute__(e) for eg in obj[coln] if hasattr(eg, e)]
+                if len(tmp) == N:
+                    metainfo[e] = np.array(tmp)
 
-    tsgroup = nap.TsGroup(tsgroup, **metainfo)
+        if coln not in ["spike_times_index", "spike_times", "electrode_group"]:
+            col = obj[coln]
+            if len(col) == N:
+                if hasattr(col, "to_dataframe"):
+                    df = col.to_dataframe()
+                    df = df.sort_index()
+                    for k in df.columns:
+                        if not isinstance(
+                            df[k].values[0],
+                            (list, tuple, dict, set, pynwb.ecephys.ElectrodeGroup),
+                        ):
+                            metainfo[k] = df[k].values
+                # elif not isinstance(col[0], (np.ndarray, list, tuple, dict, set)):
+                elif isinstance(col[0], (Number, str)):
+                    metainfo[coln] = np.array(col[:])
+                else:
+                    pass
+
+    tsgroup = nap.TsGroup(tsgroup, metadata=metainfo)
 
     return tsgroup
 
 
-def _make_ts(obj):
+def _make_ts(obj, **kwargs):
     """Helper function to make Ts
 
     Parameters
@@ -289,15 +376,18 @@ class NWBFile(UserDict):
         "Tsd": _make_tsd,
         "Ts": _make_ts,
         "TsdFrame": _make_tsd_frame,
+        "TsdTensor": _make_tsd_tensor,
         "TsGroup": _make_tsgroup,
     }
 
-    def __init__(self, file):
+    def __init__(self, file, lazy_loading=True):
         """
         Parameters
         ----------
         file : str or pynwb.file.NWBFile
             Valid file to a NWB file
+        lazy_loading: bool
+            If True return a memory-view of the data, load otherwise.
 
         Raises
         ------
@@ -306,49 +396,70 @@ class NWBFile(UserDict):
         RuntimeError
             If file is not an instance of NWBFile
         """
-        if isinstance(file, str):
-            if os.path.exists(file):
-                self.path = file
-                self.name = os.path.basename(file).split(".")[0]
-                self.io = NWBHDF5IO(file, "r")
+        # TODO: do we really need to have instantiation from file and object in the same place?
+        pynwb = importlib.import_module("pynwb")
+        NWBHDF5IO = pynwb.NWBHDF5IO
+        if isinstance(file, pynwb.file.NWBFile):
+            self.nwb = file
+            self.name = self.nwb.session_id
+        else:
+            path = Path(file)
+
+            if path.exists():
+                self.path = path
+                self.name = path.stem
+                self.io = NWBHDF5IO(path, "r")
                 self.nwb = self.io.read()
             else:
                 raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), file)
-        elif isinstance(file, pynwb.file.NWBFile):
-            self.nwb = file
-            self.name = self.nwb.subject.subject_id
 
-        else:
-            raise RuntimeError(
-                "unrecognized argument. Please provide path to a valid NWB file or open NWB file."
-            )
-
+        # Get a dictionary with full_path -> {'id', 'type'}
         self.data = _extract_compatible_data_from_nwbfile(self.nwb)
+
+        # Need to check if some object names are doublons
+        self.full_path_to_key = _get_unique_identifier(
+            {p: os.path.basename(p) for p in self.data.keys()}
+        )
+
+        # Creating the reverse mapping for the user : key -> full_path and key -> {'id', 'type'}
+        self.key_to_full_path = {v: k for k, v in self.full_path_to_key.items()}
+        self.data = {self.full_path_to_key[p]: self.data[p] for p in self.data.keys()}
+
+        # Mapping unique path identifier to id
         self.key_to_id = {k: self.data[k]["id"] for k in self.data.keys()}
 
-        self._view = Table(title=self.name)
-        self._view.add_column("Keys", justify="left", style="cyan", no_wrap=True)
-        self._view.add_column("Type", style="green")
-        # self._view.add_column("NWB module", justify="right", style="magenta")
+        self._view = [[k, self.data[k]["type"]] for k in self.data.keys()]
 
-        for k in self.data.keys():
-            self._view.add_row(
-                k,
-                self.data[k]["type"],
-                # self.data[k]['top_module']
-            )
+        self._lazy_loading = lazy_loading
 
         UserDict.__init__(self, self.data)
 
     def __str__(self):
-        """View of the object"""
-        with Console() as console:
-            console.print(self._view)
-        return ""
+        title = self.name if isinstance(self.name, str) else "-"
+        headers = ["Keys", "Type"]
+        return (
+            title
+            + "\n"
+            + tabulate(self._view, headers=headers, tablefmt="mixed_outline")
+        )
 
-    # def __repr__(self):
-    #     """View of the object"""
-    #     return ""
+        # self._view = Table(title=self.name)
+        # self._view.add_column("Keys", justify="left", style="cyan", no_wrap=True)
+        # self._view.add_column("Type", style="green")
+        # for k in self.data.keys():
+        #     self._view.add_row(
+        #         k,
+        #         self.data[k]["type"],
+        #     )
+
+        # """View of the object"""
+        # with Console() as console:
+        #     console.print(self._view)
+        # return ""
+
+    def __repr__(self):
+        """View of the object"""
+        return self.__str__()
 
     def __getitem__(self, key):
         """Get object from NWB
@@ -366,14 +477,22 @@ class NWBFile(UserDict):
         Raises
         ------
         KeyError
-            If key is not in the dictionnary
+            If key is not in the dictionary
         """
         if key.__hash__:
+            if key.startswith("/"):  # allow user to specify the full path to the object
+                if key in self.full_path_to_key:
+                    return self[self.full_path_to_key[key]]
+                else:
+                    raise KeyError("Can't find key {} in group index.".format(key))
+
             if self.__contains__(key):
                 if isinstance(self.data[key], dict) and "id" in self.data[key]:
                     obj = self.nwb.objects[self.data[key]["id"]]
                     try:
-                        data = self._f_eval[self.data[key]["type"]](obj)
+                        data = self._f_eval[self.data[key]["type"]](
+                            obj, lazy_loading=self._lazy_loading
+                        )
                     except Exception:
                         warnings.warn(
                             "Failed to build {}.\n Returning the NWB object for manual inspection".format(
@@ -389,3 +508,40 @@ class NWBFile(UserDict):
                     return self.data[key]
             else:
                 raise KeyError("Can't find key {} in group index.".format(key))
+
+    def close(self):
+        """Close the NWB file"""
+        self.io.close()
+
+    def keys(self):
+        """
+        Return keys of NWBFile
+
+        Returns
+        -------
+        list
+            List of keys
+        """
+        return list(self.data.keys())
+
+    def items(self):
+        """
+        Return a list of key/object.
+
+        Returns
+        -------
+        list
+            List of tuples
+        """
+        return list(self.data.items())
+
+    def values(self):
+        """
+        Return a list of all the objects
+
+        Returns
+        -------
+        list
+            List of objects
+        """
+        return list(self.data.values())

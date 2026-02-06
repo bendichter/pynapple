@@ -1,8 +1,10 @@
+"""
+Functions to shuffle timestamps to create surrogate datasets.
+"""
+
 import numpy as np
 
 from .. import core as nap
-
-# Random shift
 
 
 def shift_timestamps(ts, min_shift=0.0, max_shift=None):
@@ -40,7 +42,7 @@ def shift_timestamps(ts, min_shift=0.0, max_shift=None):
 # Random shuffle intervals between timestamps
 
 
-def shuffle_ts_intervals(ts, min_shift=0.0, max_shift=None):
+def shuffle_ts_intervals(ts):
     """
     Randomizes the timestamps by shuffling the intervals between them.
 

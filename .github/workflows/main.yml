@@ -5,17 +5,22 @@ on:
   push:
     branches: [ main ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, dev ]
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
 
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: Set up Python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v4
         with:
-          python-version: 3.8
+          python-version: "3.10"
       - name: Install dependencies
         run: |
           echo "testing: ${{github.ref}}"
@@ -24,25 +29,26 @@ jobs:
       - name: Lint
         run: |
           black --check pynapple
-          isort --check pynapple
+          isort --check pynapple --profile black
           flake8 pynapple --max-complexity 10
-          
+          black --check tests
+          isort --check tests --profile black
   test:
     needs: lint
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.8", "3.9", "3.10"]
+        python-version: ["3.8", "3.9", "3.10", "3.11"]
         # exclude:
         #   - os: macos-latest
         #     python-version: 3.7
         #   - os: windows-latest
         #     python-version: 3.7
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: Set up Python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v4
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
@@ -52,19 +58,53 @@ jobs:
       - name: Test
         run: |
           coverage run --source=pynapple --branch -m pytest tests/
-          coverage report -m          
+          coverage report -m
 
-      - name: Coveralls
-        env:
-            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v4.0.1
+        with:
+            token: ${{ secrets.CODECOV_TOKEN }}
+
+  documentation:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
         run: |
-            pip install coveralls
-            coveralls --service=github
+          python -m pip install --upgrade pip
+          pip install .[dev,doc]
+      - name: Build documentation
+        run: |          
+          cd doc
+          make html
+      - name: Start tmate session for debugging
+        if: failure()
+        uses: mxschmitt/action-tmate@v3
+      - name: Check html
+        uses: chabad360/htmlproofer@master
+        with:
+          directory: "doc/_build/html"
+          # The directory to scan
+          arguments: 
+            --checks Links,Scripts 
+            --ignore-urls "https://fonts.gstatic.com,https://mkdocs-gallery.github.io,./doc/_build/html/_static/,https://www.nature.com/articles/s41593-022-01020-w,https://elifesciences.org/reviewed-preprints/85786" 
+            --assume-extension 
+            --check-external-hash 
+            --ignore-status-codes 403 
+            --ignore-files "/.+\/html\/_static\/.+/"
+          # The arguments to pass to HTMLProofer
+
   check:
     if: always()
     needs:
     - lint
     - test
+    - documentation
     runs-on: ubuntu-latest
     steps:
     - name: Decide whether all tests and notebooks succeeded

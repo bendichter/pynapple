@@ -4,12 +4,12 @@
 Various io functions
 
 """
-import os
+import importlib
+import warnings
+from pathlib import Path
 from xml.dom import minidom
 
 import numpy as np
-from pynwb import NWBHDF5IO
-from pynwb.ecephys import LFP, ElectricalSeries
 
 from .. import core as nap
 from .cnmfe import CNMF_E, InscopixCNMFE, Minian
@@ -22,7 +22,7 @@ from .phy import Phy
 from .suite2p import Suite2P
 
 
-def load_file(path):
+def load_file(path, lazy_loading=None):
     """Load file. Current format supported is (npz,nwb,)
 
     .npz -> If the file is compatible with a pynapple format, the function will return a pynapple object.
@@ -34,6 +34,9 @@ def load_file(path):
     ----------
     path : str
         Path to the file
+    lazy_loading : bool, optional default True
+        Lazy loading of the data. If not specified, the function will use the defaults
+        True. Works only with NWB files.
 
     Returns
     -------
@@ -45,15 +48,23 @@ def load_file(path):
     FileNotFoundError
         If file is missing
     """
-    if os.path.isfile(path):
-        if path.endswith(".npz"):
-            return NPZFile(path).load()
-        elif path.endswith(".nwb"):
-            return NWBFile(path)
-        else:
-            raise RuntimeError("File format not supported")
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"File {path} does not exist")
+
+    if path.suffix == ".npz":
+        if lazy_loading:
+            warnings.warn("Lazy loading is not supported for NPZ files")
+        return NPZFile(path).load()
+
+    elif path.suffix == ".nwb":
+        # preserves class init default:
+        kwargs_for_lazyloading = (
+            {} if lazy_loading is None else {"lazy_loading": lazy_loading}
+        )
+        return NWBFile(path, **kwargs_for_lazyloading)
     else:
-        raise FileNotFoundError("File {} does not exist".format(path))
+        raise RuntimeError("File format not supported")
 
 
 def load_folder(path):
@@ -69,20 +80,20 @@ def load_folder(path):
     Returns
     -------
     Folder
-        A dictionnary-like class containing all the sub-folders and compatible files (i.e. npz, nwb)
+        A dictionary-like class containing all the sub-folders and compatible files (i.e. npz, nwb)
 
     Raises
     ------
     RuntimeError
         If folder is missing
     """
-    if os.path.isdir(path):
-        return Folder(path)
-    else:
-        raise RuntimeError("Folder {} does not exist".format(path))
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Folder {path} does not exist")
+    return Folder(path)
 
 
-def load_session(path=None, session_type=None):
+def load_session(path, session_type=None):
     """
     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     % WARNING : THIS FUNCTION IS DEPRECATED %
@@ -112,9 +123,8 @@ def load_session(path=None, session_type=None):
         A class holding all the data from the session.
 
     """
-    if path:
-        if not os.path.isdir(path):
-            raise RuntimeError("Path {} is not found.".format(path))
+    path = Path(path)
+    assert path.exists(), f"Folder {path} does not exist"
 
     if isinstance(session_type, str):
         session_type = session_type.lower()
@@ -180,17 +190,18 @@ def load_eeg(
     Deleted Parameters
     ------------------
     extension : str, optional
-        The file extenstion (.eeg, .dat, .lfp). Make sure the frequency match
+        The file extention (.eeg, .dat, .lfp). Make sure the frequency match
 
     """
     # Need to check if a xml file exists
-    path = os.path.dirname(filepath)
-    basename = os.path.basename(filepath).split(".")[0]
-    listdir = os.listdir(path)
+    filepath = Path(filepath)
+    path = filepath.parent
+    basename = filepath.name.split(".")[0]
+    listdir = list(path.glob("*"))
 
     if frequency is None or n_channels is None:
         if basename + ".xml" in listdir:
-            xmlpath = os.path.join(path, basename + ".xml")
+            xmlpath = path / (basename + ".xml")
             xmldoc = minidom.parse(xmlpath)
         else:
             raise RuntimeError(
@@ -227,13 +238,13 @@ def load_eeg(
     n_samples = int((endoffile - startoffile) / n_channels / bytes_size)
     duration = n_samples / frequency
     f.close()
-    fp = np.memmap(filepath, np.int16, "r", shape=(n_samples, n_channels))
+    fp = np.memmap(filepath, precision, "r", shape=(n_samples, n_channels))
     timestep = np.arange(0, n_samples) / frequency
 
     time_support = nap.IntervalSet(start=0, end=duration, time_units="s")
 
     if channel is None:
-        return fp
+        return nap.TsdFrame(t=timestep, d=fp)
     elif type(channel) is int:
         return nap.Tsd(
             t=timestep, d=fp[:, channel], time_units="s", time_support=time_support
@@ -268,43 +279,38 @@ def append_NWB_LFP(path, lfp, channel=None):
         If no channel is specify when passing a Tsd
 
     """
-    new_path = os.path.join(path, "pynapplenwb")
+    pynwb = importlib.import_module("pynwb")
+    path = Path(path)
+    new_path = path / "pynapplenwb"
     nwb_path = ""
-    if os.path.exists(new_path):
-        nwbfilename = [f for f in os.listdir(new_path) if f.endswith(".nwb")]
-        if len(nwbfilename):
-            nwb_path = os.path.join(path, "pynapplenwb", nwbfilename[0])
-    else:
-        nwbfilename = [f for f in os.listdir(path) if f.endswith(".nwb")]
-        if len(nwbfilename):
-            nwb_path = os.path.join(path, "pynapplenwb", nwbfilename[0])
-
-    if len(nwb_path) == 0:
+    try:
+        nwb_path = next(new_path.glob("*.nwb"))
+    except StopIteration:
         raise RuntimeError("Can't find nwb file in {}".format(path))
 
     if isinstance(lfp, nap.TsdFrame):
-        channels = lfp.columns.values
+        channels = list(lfp.columns.values)
     elif isinstance(lfp, nap.Tsd):
         if isinstance(channel, int):
             channels = [channel]
         else:
             raise RuntimeError("Please specify which channel it is.")
 
-    io = NWBHDF5IO(nwb_path, "r+")
+    io = pynwb.NWBHDF5IO(nwb_path, "r+")
     nwbfile = io.read()
 
     all_table_region = nwbfile.create_electrode_table_region(
         region=channels, description="", name="electrodes"
     )
 
-    lfp_electrical_series = ElectricalSeries(
+    lfp_electrical_series = pynwb.ecephys.ElectricalSeries(
         name="ElectricalSeries",
         data=lfp.values,
         timestamps=lfp.index.values,
         electrodes=all_table_region,
     )
 
-    lfp = LFP(electrical_series=lfp_electrical_series)
+    lfp = pynwb.ecephys.LFP(electrical_series=lfp_electrical_series)
 
     ecephys_module = nwbfile.create_processing_module(
         name="ecephys", description="processed extracellular electrophysiology data"
